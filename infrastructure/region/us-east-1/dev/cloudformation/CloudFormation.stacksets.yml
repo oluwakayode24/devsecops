@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda function with EventBridge rule and IAM role
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: disable-access-rosi-key-iam-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "iam:ListUsers"
+                  - "iam:ListAccessKeys"
+                  - "iam:GetAccessKeyLastUsed"
+                  - "iam:UpdateAccessKey"
+                  - "iam:ListUserTags"
+                  - "iam:ListAccountAliases"
+                  - "iam:PassRole"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "ses:SendEmail"
+                  - "ses:SendRawEmail"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+
+  DisableAccessKeyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: disable-access-key-function
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import re
+          from io import StringIO
+          from datetime import datetime, timezone
+          from botocore.exceptions import ClientError
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+          from email.mime.application import MIMEApplication
+
+          def lambda_handler(event, context):
+              iam_client = boto3.client('iam')
+              ses_client = boto3.client('ses')
+              account_id = boto3.client('sts').get_caller_identity().get('Account')
+              account_alias = get_account_alias(iam_client)
+              users = iam_client.list_users()['Users']
+              csv_output = StringIO()
+              csv_writer = csv.writer(csv_output)
+              csv_writer.writerow(['AccountNumber', 'AccountAlias', 'UserName', 'AccessKeyId', 'Disabled'])
+              report_needed = False
+
+              for user in users:
+                  user_name = user['UserName']
+                  user_email = get_user_email(iam_client, user_name)
+                  keys = iam_client.list_access_keys(UserName=user_name)['AccessKeyMetadata']
+
+                  for key in keys:
+                      if key['Status'] == 'Active':
+                          key_id = key['AccessKeyId']
+                          last_used_response = iam_client.get_access_key_last_used(AccessKeyId=key_id)
+                          last_used_date = last_used_response['AccessKeyLastUsed'].get('LastUsedDate')
+                          if last_used_date and days_since(last_used_date) > 45:
+                              iam_client.update_access_key(UserName=user_name, AccessKeyId=key_id, Status='Inactive')
+                              if user_email:
+                                  send_individual_email(ses_client, user_email, user_name)
+                              else:
+                                  csv_writer.writerow(["'" + account_id, account_alias, user_name, key_id, 'Yes'])
+                                  report_needed = True
+
+              if report_needed:
+                  send_report_via_email(ses_client, csv_output.getvalue())
+
+              return {'statusCode': 200, 'body': 'Process completed successfully'}
+
+          def get_user_email(iam_client, user_name):
+              tags = iam_client.list_user_tags(UserName=user_name).get('Tags', [])
+              for tag in tags:
+                  if is_valid_email(tag['Value']):
+                      return tag['Value']
+              return None
+
+          def is_valid_email(email):
+              return bool(re.match(r"[^@]+@[^@]+\.[^@]+", email))
+
+          def send_individual_email(ses_client, email, user_name):
+              subject = "Access Key Disabled"
+              body_text = f"<html><body><p style='font-size:16px;'><b>Your Access key for this User ({user_name}) has been disabled because it has not been used in the last 45 days.</b></p></body></html>"
+              msg = MIMEMultipart('alternative')
+              msg['Subject'] = subject
+              msg.attach(MIMEText(body_text, 'html'))
+              ses_client.send_raw_email(Source='darekorex143@gmail.com', Destinations=[email], RawMessage={'Data': msg.as_string()})
+
+          def send_report_via_email(ses_client, csv_data):
+              current_date = datetime.now().strftime("%Y-%m-%d")
+              subject = f"Report on Disabled AWS IAM Access Keys - {current_date}"
+              body_text = "<html><body><p style='font-size:16px;'><b>Please find the attached report on disabled AWS IAM access keys.</b></p></body></html>"
+              
+              msg = MIMEMultipart('alternative')
+              msg['Subject'] = subject
+              msg.attach(MIMEText(body_text, 'html'))
+
+              part = MIMEApplication(csv_data, Name='DisabledKeysReport.csv')
+              part['Content-Disposition'] = 'attachment; filename=\"DisabledKeysReport.csv\"'
+              msg.attach(part)
+
+              ses_client.send_raw_email(Source='iamkhay32@gmail.com', Destinations=['iamkhay32@gmail.com'], RawMessage={'Data': msg.as_string()})
+
+          def get_account_alias(iam_client):
+              aliases = iam_client.list_account_aliases().get('AccountAliases', [])
+              return aliases[0] if aliases else 'NoAlias'
+
+          def days_since(last_used_date):
+              now = datetime.now(timezone.utc)
+              return (now - last_used_date).days
+
+  DisableAccessEventBridge:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: disable-access-event-bridge
+      ScheduleExpression: 'cron(0 14 * * ? *)'  # 8 AM CST = 2 PM UTC
+      Targets:
+        - Arn: !GetAtt DisableAccessKeyFunction.Arn
+          Id: "DisableAccessKeyFunctionTarget"
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DisableAccessKeyFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DisableAccessEventBridge.Arn
+
+  CloudOpsSESEmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: iamkhay32@gmail.com
