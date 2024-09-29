@@ -24,7 +24,7 @@ jobs:
       uses: checkmarx/kics-github-action@v2.0.0
       with:
         path: ${{ inputs.WORKING_DIRECTORY }}
-        #fail_on: 'high' #enforicng kics to stop plan job to run if any high severity is found in the code
+        fail_on: 'high' #enforicng kics to stop plan job to run if any high severity is found in the code
         token: ${{ secrets.GITHUB_TOKEN }}
         output_path: myResults/
         enable_comments: ${{ inputs.ENABLE_COMMENTS }}
