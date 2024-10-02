@@ -1,4 +1,4 @@
-name: Merge and pull request to main branch #describes the action 
+name: Iac scanning #describes the action 
 on:
   workflow_dispatch:    #This will allow running github actions workflow manually
     inputs:

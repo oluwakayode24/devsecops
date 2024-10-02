@@ -17,6 +17,6 @@ resource "aws_instance" "rosi_ec2_datablock" {
   instance_type = "t2.micro"
 
   tags = {
-    Name = "HelloWorld"
+    Name = "Rosi_ec2_instance_2"
   }
 }
